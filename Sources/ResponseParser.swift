@@ -40,10 +40,14 @@ struct ResponseParserContext {
 
     var buildingHeaderField = ""
     var currentHeaderField = ""
-    var completion: Response -> Void
+    let headerCompletion: Response -> Void
+    let onBody: [Int8] -> Void
+    let messageCompletion: Response -> Void
 
-    init(completion: Response -> Void) {
-        self.completion = completion
+    init(headerCompletion: Response -> Void = {_ in}, onBody: [Int8] -> Void = {_ in}, messageCompletion: Response -> Void) {
+        self.headerCompletion = headerCompletion
+        self.onBody = onBody
+        self.messageCompletion = messageCompletion
     }
 }
 
@@ -62,15 +66,25 @@ var responseSettings: http_parser_settings = {
 }()
 
 public final class ResponseParser {
-    let completion: Response -> Void
+    let headerCompletion: Response -> Void
+    let onBody: [Int8] -> Void
+    let messageCompletion: Response -> Void
     let context: UnsafeMutablePointer<ResponseParserContext>
     var parser = http_parser()
 
-    public init(completion: Response -> Void) {
-        self.completion = completion
+    public init(headerCompletion : Response -> Void = {_ in}, onBody: [Int8] -> Void = {_ in}, messageCompletion: Response -> Void) {
+        self.headerCompletion = headerCompletion
+        self.onBody = onBody
+        self.messageCompletion = messageCompletion
 
         self.context = UnsafeMutablePointer<ResponseParserContext>.alloc(1)
-        self.context.initialize(ResponseParserContext(completion: completion))
+        self.context.initialize(
+            ResponseParserContext(
+                headerCompletion: headerCompletion,
+                onBody: onBody,
+                messageCompletion: messageCompletion
+            )
+        )
 
         http_parser_init(&self.parser, HTTP_RESPONSE)
         self.parser.data = UnsafeMutablePointer<Void>(context)
@@ -83,7 +97,6 @@ public final class ResponseParser {
 
     public func parse(data: UnsafeMutablePointer<Void>, length: Int) throws {
         let bytesParsed = http_parser_execute(&parser, &responseSettings, UnsafeMutablePointer<Int8>(data), length)
-
         if bytesParsed != length {
             let errorName = http_errno_name(http_errno(parser.http_errno))
             let errorDescription = http_errno_description(http_errno(parser.http_errno))
@@ -154,6 +167,17 @@ func onResponseHeadersComplete(parser: UnsafeMutablePointer<http_parser>) -> Int
     context.memory.statusCode = Int(parser.memory.status_code)
     context.memory.majorVersion = Int(parser.memory.http_major)
     context.memory.minorVersion = Int(parser.memory.http_minor)
+    
+    let response = Response(
+        statusCode: context.memory.statusCode,
+        reasonPhrase: context.memory.reasonPhrase,
+        majorVersion: context.memory.majorVersion,
+        minorVersion: context.memory.minorVersion,
+        headers: context.memory.headers,
+        body: []
+    )
+    
+    context.memory.headerCompletion(response)
 
     return 0
 }
@@ -163,7 +187,12 @@ func onResponseBody(parser: UnsafeMutablePointer<http_parser>, data: UnsafePoint
 
     var buffer: [Int8] = [Int8](count: length, repeatedValue: 0)
     memcpy(&buffer, data, length)
-    context.memory.body += buffer
+    
+    if context.memory.headers["transfer-encoding"]?.lowercaseString == "chunked" {
+        context.memory.onBody(buffer)
+    } else {
+        context.memory.body += buffer
+    }
 
     return 0
 }
@@ -180,7 +209,7 @@ func onResponseMessageComplete(parser: UnsafeMutablePointer<http_parser>) -> Int
         body: context.memory.body
     )
 
-    context.memory.completion(response)
+    context.memory.messageCompletion(response)
 
     context.memory.statusCode = 0
     context.memory.reasonPhrase = ""
