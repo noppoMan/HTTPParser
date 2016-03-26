@@ -37,46 +37,49 @@ struct ResponseParserContext {
     var minorVersion: Int = 0
     var headers: [String: String] = [:]
     var body: [Int8] = []
-
+    
     var buildingHeaderField = ""
     var currentHeaderField = ""
     let headerCompletion: Response -> Void
     let onBody: [Int8] -> Void
     let messageCompletion: Response -> Void
-
-    init(headerCompletion: Response -> Void = {_ in}, onBody: [Int8] -> Void = {_ in}, messageCompletion: Response -> Void) {
+    
+    init(headerCompletion: Response -> Void, onBody: [Int8] -> Void, messageCompletion: Response -> Void) {
         self.headerCompletion = headerCompletion
         self.onBody = onBody
         self.messageCompletion = messageCompletion
     }
 }
 
+extension ResponseParserContext {
+    private func getHeader(header: String) -> String? {
+        for (key, value) in headers where key.lowercaseString == header.lowercaseString {
+            return value
+        }
+        return nil
+    }
+}
+
 var responseSettings: http_parser_settings = {
     var settings = http_parser_settings()
     http_parser_settings_init(&settings)
-
+    
     settings.on_status           = onResponseStatus
     settings.on_header_field     = onResponseHeaderField
     settings.on_header_value     = onResponseHeaderValue
     settings.on_headers_complete = onResponseHeadersComplete
     settings.on_body             = onResponseBody
     settings.on_message_complete = onResponseMessageComplete
-
+    
     return settings
 }()
 
 public final class ResponseParser {
-    let headerCompletion: Response -> Void
-    let onBody: [Int8] -> Void
-    let messageCompletion: Response -> Void
     let context: UnsafeMutablePointer<ResponseParserContext>
     var parser = http_parser()
-
-    public init(headerCompletion : Response -> Void = {_ in}, onBody: [Int8] -> Void = {_ in}, messageCompletion: Response -> Void) {
-        self.headerCompletion = headerCompletion
-        self.onBody = onBody
-        self.messageCompletion = messageCompletion
-
+    
+    public init(headerCompletion : Response -> Void = {_ in}, onBody: [Int8] -> Void = {_ in  print("aaaaaaa") }, messageCompletion: Response -> Void) {
+        
         self.context = UnsafeMutablePointer<ResponseParserContext>.alloc(1)
         self.context.initialize(
             ResponseParserContext(
@@ -85,16 +88,16 @@ public final class ResponseParser {
                 messageCompletion: messageCompletion
             )
         )
-
+        
         http_parser_init(&self.parser, HTTP_RESPONSE)
         self.parser.data = UnsafeMutablePointer<Void>(context)
     }
-
+    
     deinit {
         context.destroy()
         context.dealloc(1)
     }
-
+    
     public func parse(data: UnsafeMutablePointer<Void>, length: Int) throws {
         let bytesParsed = http_parser_execute(&parser, &responseSettings, UnsafeMutablePointer<Int8>(data), length)
         if bytesParsed != length {
@@ -111,12 +114,12 @@ extension ResponseParser {
         var data = data
         try parse(&data, length: data.count)
     }
-
+    
     public func parse(string: String) throws {
         var data = string.utf8.map { Int8($0) }
         try parse(&data, length: data.count)
     }
-
+    
     public func eof() throws {
         try parse(nil, length: 0)
     }
@@ -124,28 +127,28 @@ extension ResponseParser {
 
 func onResponseStatus(parser: UnsafeMutablePointer<http_parser>, data: UnsafePointer<Int8>, length: Int) -> Int32 {
     let context = UnsafeMutablePointer<ResponseParserContext>(parser.memory.data)
-
+    
     var buffer: [Int8] = [Int8](count: length + 1, repeatedValue: 0)
     strncpy(&buffer, data, length)
     context.memory.reasonPhrase += String.fromCString(buffer)!
-
+    
     return 0
-
+    
 }
 
 func onResponseHeaderField(parser: UnsafeMutablePointer<http_parser>, data: UnsafePointer<Int8>, length: Int) -> Int32 {
     let context = UnsafeMutablePointer<ResponseParserContext>(parser.memory.data)
-
+    
     var buffer: [Int8] = [Int8](count: length + 1, repeatedValue: 0)
     strncpy(&buffer, data, length)
     context.memory.buildingHeaderField += String.fromCString(buffer)!
-
+    
     return 0
 }
 
 func onResponseHeaderValue(parser: UnsafeMutablePointer<http_parser>, data: UnsafePointer<Int8>, length: Int) -> Int32 {
     let context = UnsafeMutablePointer<ResponseParserContext>(parser.memory.data)
-
+    
     var buffer: [Int8] = [Int8](count: length + 1, repeatedValue: 0)
     strncpy(&buffer, data, length)
     if context.memory.buildingHeaderField != "" {
@@ -155,13 +158,13 @@ func onResponseHeaderValue(parser: UnsafeMutablePointer<http_parser>, data: Unsa
     let headerField = context.memory.currentHeaderField
     let previousHeaderValue = context.memory.headers[headerField] ?? ""
     context.memory.headers[headerField] = previousHeaderValue + String.fromCString(buffer)!
-
+    
     return 0
 }
 
 func onResponseHeadersComplete(parser: UnsafeMutablePointer<http_parser>) -> Int32 {
     let context = UnsafeMutablePointer<ResponseParserContext>(parser.memory.data)
-
+    
     context.memory.buildingHeaderField = ""
     context.memory.currentHeaderField = ""
     context.memory.statusCode = Int(parser.memory.status_code)
@@ -178,28 +181,28 @@ func onResponseHeadersComplete(parser: UnsafeMutablePointer<http_parser>) -> Int
     )
     
     context.memory.headerCompletion(response)
-
+    
     return 0
 }
 
 func onResponseBody(parser: UnsafeMutablePointer<http_parser>, data: UnsafePointer<Int8>, length: Int) -> Int32 {
     let context = UnsafeMutablePointer<ResponseParserContext>(parser.memory.data)
-
+    
     var buffer: [Int8] = [Int8](count: length, repeatedValue: 0)
     memcpy(&buffer, data, length)
     
-    if context.memory.headers["transfer-encoding"]?.lowercaseString == "chunked" {
+    if context.memory.getHeader("transfer-encoding")?.lowercaseString == "chunked" {
         context.memory.onBody(buffer)
     } else {
         context.memory.body += buffer
     }
-
+    
     return 0
 }
 
 func onResponseMessageComplete(parser: UnsafeMutablePointer<http_parser>) -> Int32 {
     let context = UnsafeMutablePointer<ResponseParserContext>(parser.memory.data)
-
+    
     let response = Response(
         statusCode: context.memory.statusCode,
         reasonPhrase: context.memory.reasonPhrase,
@@ -208,15 +211,15 @@ func onResponseMessageComplete(parser: UnsafeMutablePointer<http_parser>) -> Int
         headers: context.memory.headers,
         body: context.memory.body
     )
-
+    
     context.memory.messageCompletion(response)
-
+    
     context.memory.statusCode = 0
     context.memory.reasonPhrase = ""
     context.memory.majorVersion = 0
     context.memory.minorVersion = 0
     context.memory.headers = [:]
     context.memory.body = []
-
+    
     return 0
 }
