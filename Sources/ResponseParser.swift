@@ -1,4 +1,4 @@
-// RequestParser.swift
+// ResponseParser.swift
 //
 // The MIT License (MIT)
 //
@@ -22,39 +22,38 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#if os(Linux)
-    import Glibc
-#else
-    import Darwin.C
-#endif
-import HTTP
 import CHTTPParser
+
+typealias ResponseContext = UnsafeMutablePointer<ResponseParserContext>
 
 struct ResponseParserContext {
     var statusCode: Int = 0
     var reasonPhrase: String = ""
-    var majorVersion: Int = 0
-    var minorVersion: Int = 0
-    var headers: [String: String] = [:]
-    var body: [Int8] = []
-    
-    var buildingHeaderField = ""
-    var currentHeaderField = ""
+    var version: Version = Version(major: 0, minor: 0)
+    var headers: Headers = [:]
+    var body: Data = []
+
+    var buildingHeaderName = ""
+    var currentHeaderName: HeaderName = ""
+
     let headerCompletion: Response -> Void
-    let onBody: [Int8] -> Void
+    let onBody: Data -> Void
     let messageCompletion: Response -> Void
-    
-    init(headerCompletion: Response -> Void, onBody: [Int8] -> Void, messageCompletion: Response -> Void) {
+
+    init(headerCompletion: Response -> Void, onBody: Data -> Void, messageCompletion: Response -> Void) {
         self.headerCompletion = headerCompletion
         self.onBody = onBody
         self.messageCompletion = messageCompletion
     }
 }
 
+
 extension ResponseParserContext {
-    private func getHeader(header: String) -> String? {
-        for (key, value) in headers where key.lowercaseString == header.lowercaseString {
-            return value
+    private func getHeader(header: HeaderName) -> HeaderValues? {
+        for (key, value) in headers {
+            if key == header {
+              return value
+            }
         }
         return nil
     }
@@ -63,163 +62,174 @@ extension ResponseParserContext {
 var responseSettings: http_parser_settings = {
     var settings = http_parser_settings()
     http_parser_settings_init(&settings)
-    
+
     settings.on_status           = onResponseStatus
     settings.on_header_field     = onResponseHeaderField
     settings.on_header_value     = onResponseHeaderValue
     settings.on_headers_complete = onResponseHeadersComplete
     settings.on_body             = onResponseBody
     settings.on_message_complete = onResponseMessageComplete
-    
+
     return settings
 }()
 
-public final class ResponseParser {
-    let context: UnsafeMutablePointer<ResponseParserContext>
+public final class ResponseParser: S4.ResponseParser {
+    let context: ResponseContext
     var parser = http_parser()
-    
-    public init(headerCompletion : Response -> Void = {_ in}, onBody: [Int8] -> Void = {_ in  print("aaaaaaa") }, messageCompletion: Response -> Void) {
-        
-        self.context = UnsafeMutablePointer<ResponseParserContext>.alloc(1)
-        self.context.initialize(
-            ResponseParserContext(
-                headerCompletion: headerCompletion,
-                onBody: onBody,
-                messageCompletion: messageCompletion
-            )
-        )
-        
-        http_parser_init(&self.parser, HTTP_RESPONSE)
-        self.parser.data = UnsafeMutablePointer<Void>(context)
+    var response: Response?
+
+    public init(headerCompletion : Response -> Void = {_ in}, onBody: Data -> Void = {_ in }, messageCompletion: Response -> Void) {
+        context = ResponseContext(allocatingCapacity: 1)
+        context.initialize(with: ResponseParserContext(
+            headerCompletion: headerCompletion,
+            onBody: onBody,
+            messageCompletion: messageCompletion
+        ))
+
+        resetParser()
     }
-    
+
     deinit {
-        context.destroy()
-        context.dealloc(1)
+        context.deinitialize(count: 1)
+        context.deallocateCapacity(1)
     }
-    
-    public func parse(data: UnsafeMutablePointer<Void>, length: Int) throws {
-        let bytesParsed = http_parser_execute(&parser, &responseSettings, UnsafeMutablePointer<Int8>(data), length)
-        if bytesParsed != length {
+
+    func resetParser() {
+        http_parser_init(&parser, HTTP_RESPONSE)
+        parser.data = UnsafeMutablePointer<Void>(context)
+    }
+
+    public func parse(data: Data) throws -> Response? {
+        defer { response = nil }
+
+        var data = data
+
+        let buffer = data.withUnsafeMutableBufferPointer {
+            UnsafeMutablePointer<Int8>($0.baseAddress)
+        }
+
+        let bytesParsed = http_parser_execute(&parser, &responseSettings, buffer, data.count)
+
+        if bytesParsed != data.count {
+            resetParser()
             let errorName = http_errno_name(http_errno(parser.http_errno))
             let errorDescription = http_errno_description(http_errno(parser.http_errno))
-            let error = ParseError(description: "\(String.fromCString(errorName)!): \(String.fromCString(errorDescription)!)")
+            let error = ParseError(description: "\(String(validatingUTF8: errorName)!): \(String(validatingUTF8: errorDescription)!)")
             throw error
         }
+
+        if response != nil {
+            resetParser()
+        }
+
+        return response
     }
 }
 
 extension ResponseParser {
-    public func parse(data: [Int8]) throws {
-        var data = data
-        try parse(&data, length: data.count)
-    }
-    
-    public func parse(string: String) throws {
-        var data = string.utf8.map { Int8($0) }
-        try parse(&data, length: data.count)
-    }
-    
-    public func eof() throws {
-        try parse(nil, length: 0)
+    public func parse(convertible: DataConvertible) throws -> Response? {
+        return try parse(convertible.data)
     }
 }
 
-func onResponseStatus(parser: UnsafeMutablePointer<http_parser>, data: UnsafePointer<Int8>, length: Int) -> Int32 {
-    let context = UnsafeMutablePointer<ResponseParserContext>(parser.memory.data)
-    
-    var buffer: [Int8] = [Int8](count: length + 1, repeatedValue: 0)
-    strncpy(&buffer, data, length)
-    context.memory.reasonPhrase += String.fromCString(buffer)!
-    
-    return 0
-    
-}
+func onResponseStatus(parser: Parser, data: UnsafePointer<Int8>, length: Int) -> Int32 {
+    return ResponseContext(parser.pointee.data).withMemory {
+        guard let reasonPhrase = String(pointer: data, length: length) else {
+            return 1
+        }
 
-func onResponseHeaderField(parser: UnsafeMutablePointer<http_parser>, data: UnsafePointer<Int8>, length: Int) -> Int32 {
-    let context = UnsafeMutablePointer<ResponseParserContext>(parser.memory.data)
-    
-    var buffer: [Int8] = [Int8](count: length + 1, repeatedValue: 0)
-    strncpy(&buffer, data, length)
-    context.memory.buildingHeaderField += String.fromCString(buffer)!
-    
-    return 0
-}
-
-func onResponseHeaderValue(parser: UnsafeMutablePointer<http_parser>, data: UnsafePointer<Int8>, length: Int) -> Int32 {
-    let context = UnsafeMutablePointer<ResponseParserContext>(parser.memory.data)
-    
-    var buffer: [Int8] = [Int8](count: length + 1, repeatedValue: 0)
-    strncpy(&buffer, data, length)
-    if context.memory.buildingHeaderField != "" {
-        context.memory.currentHeaderField = context.memory.buildingHeaderField
+        $0.reasonPhrase += reasonPhrase
+        return 0
     }
-    context.memory.buildingHeaderField = ""
-    let headerField = context.memory.currentHeaderField
-    let previousHeaderValue = context.memory.headers[headerField] ?? ""
-    context.memory.headers[headerField] = previousHeaderValue + String.fromCString(buffer)!
-    
-    return 0
 }
 
-func onResponseHeadersComplete(parser: UnsafeMutablePointer<http_parser>) -> Int32 {
-    let context = UnsafeMutablePointer<ResponseParserContext>(parser.memory.data)
-    
-    context.memory.buildingHeaderField = ""
-    context.memory.currentHeaderField = ""
-    context.memory.statusCode = Int(parser.memory.status_code)
-    context.memory.majorVersion = Int(parser.memory.http_major)
-    context.memory.minorVersion = Int(parser.memory.http_minor)
-    
-    let response = Response(
-        statusCode: context.memory.statusCode,
-        reasonPhrase: context.memory.reasonPhrase,
-        majorVersion: context.memory.majorVersion,
-        minorVersion: context.memory.minorVersion,
-        headers: context.memory.headers,
-        body: []
-    )
-    
-    context.memory.headerCompletion(response)
-    
-    return 0
-}
+func onResponseHeaderField(parser: Parser, data: UnsafePointer<Int8>, length: Int) -> Int32 {
+    return ResponseContext(parser.pointee.data).withMemory {
+        guard let headerName = String(pointer: data, length: length) else {
+            return 1
+        }
 
-func onResponseBody(parser: UnsafeMutablePointer<http_parser>, data: UnsafePointer<Int8>, length: Int) -> Int32 {
-    let context = UnsafeMutablePointer<ResponseParserContext>(parser.memory.data)
-    
-    var buffer: [Int8] = [Int8](count: length, repeatedValue: 0)
-    memcpy(&buffer, data, length)
-    
-    if context.memory.getHeader("transfer-encoding")?.lowercaseString == "chunked" {
-        context.memory.onBody(buffer)
-    } else {
-        context.memory.body += buffer
+        if $0.currentHeaderName != "" {
+            $0.currentHeaderName = ""
+        }
+
+        $0.buildingHeaderName += headerName
+        return 0
     }
-    
-    return 0
 }
 
-func onResponseMessageComplete(parser: UnsafeMutablePointer<http_parser>) -> Int32 {
-    let context = UnsafeMutablePointer<ResponseParserContext>(parser.memory.data)
-    
-    let response = Response(
-        statusCode: context.memory.statusCode,
-        reasonPhrase: context.memory.reasonPhrase,
-        majorVersion: context.memory.majorVersion,
-        minorVersion: context.memory.minorVersion,
-        headers: context.memory.headers,
-        body: context.memory.body
-    )
-    
-    context.memory.messageCompletion(response)
-    
-    context.memory.statusCode = 0
-    context.memory.reasonPhrase = ""
-    context.memory.majorVersion = 0
-    context.memory.minorVersion = 0
-    context.memory.headers = [:]
-    context.memory.body = []
-    
-    return 0
+func onResponseHeaderValue(parser: Parser, data: UnsafePointer<Int8>, length: Int) -> Int32 {
+    return ResponseContext(parser.pointee.data).withMemory {
+        guard let headerValue = String(pointer: data, length: length) else {
+            return 1
+        }
+
+        if $0.currentHeaderName == "" {
+            $0.currentHeaderName = HeaderName($0.buildingHeaderName)
+            $0.buildingHeaderName = ""
+
+            $0.headers[$0.currentHeaderName].append("")
+        }
+
+        let previousHeaderValue = $0.headers[$0.currentHeaderName].last ?? ""
+        $0.headers[$0.currentHeaderName][$0.headers[$0.currentHeaderName].count - 1] = previousHeaderValue + headerValue
+
+        return 0
+    }
+}
+
+func onResponseHeadersComplete(parser: Parser) -> Int32 {
+    return ResponseContext(parser.pointee.data).withMemory {
+        $0.buildingHeaderName = ""
+        $0.currentHeaderName = ""
+        $0.statusCode = Int(parser.pointee.status_code)
+        let major = Int(parser.pointee.http_major)
+        let minor = Int(parser.pointee.http_minor)
+        $0.version = Version(major: major, minor: minor)
+
+        let response = Response(
+            version: $0.version,
+            status: Status(statusCode: $0.statusCode, reasonPhrase: $0.reasonPhrase),
+            headers: $0.headers,
+            body: .buffer($0.body)
+        )
+
+        $0.headerCompletion(response)
+
+        return 0
+    }
+}
+
+func onResponseBody(parser: Parser, data: UnsafePointer<Int8>, length: Int) -> Int32 {
+    return ResponseContext(parser.pointee.data).withMemory {
+
+        let data = Data(pointer: data, length: length)
+        
+        if $0.getHeader("transfer-encoding")?.first?.lowercased() == "chunked" {
+            $0.onBody(data)
+        } else {
+            $0.body += data
+        }
+
+        return 0
+    }
+}
+
+func onResponseMessageComplete(parser: Parser) -> Int32 {
+    return ResponseContext(parser.pointee.data).withMemory {
+        let response = Response(
+            version: $0.version,
+            status: Status(statusCode: $0.statusCode, reasonPhrase: $0.reasonPhrase),
+            headers: $0.headers,
+            body: .buffer($0.body)
+        )
+
+        $0.messageCompletion(response)
+        $0.statusCode = 0
+        $0.reasonPhrase = ""
+        $0.version = Version(major: 0, minor: 0)
+        $0.headers = [:]
+        $0.body = []
+        return 0
+    }
 }

@@ -1,4 +1,4 @@
-// HTTPParser.h
+// LinuxMain.swift
 //
 // The MIT License (MIT)
 //
@@ -21,3 +21,17 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+
+<<<<<<< HEAD:Sources/ParseError.swift
+public struct ParseError: ErrorType {
+    let description: String
+}
+=======
+import XCTest
+
+@testable import HTTPParserTestSuite
+
+XCTMain([
+    testCase(RequestParserTests.allTests),
+])
+>>>>>>> upstream/master:Tests/LinuxMain.swift
