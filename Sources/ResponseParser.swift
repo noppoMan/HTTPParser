@@ -47,18 +47,6 @@ struct ResponseParserContext {
     }
 }
 
-
-extension ResponseParserContext {
-    private func getHeader(header: HeaderName) -> HeaderValues? {
-        for (key, value) in headers {
-            if key == header {
-              return value
-            }
-        }
-        return nil
-    }
-}
-
 var responseSettings: http_parser_settings = {
     var settings = http_parser_settings()
     http_parser_settings_init(&settings)
@@ -204,8 +192,7 @@ func onResponseBody(parser: Parser, data: UnsafePointer<Int8>, length: Int) -> I
     return ResponseContext(parser.pointee.data).withMemory {
 
         let data = Data(pointer: data, length: length)
-        
-        if $0.getHeader("transfer-encoding")?.first?.lowercased() == "chunked" {
+        if $0.headers["transfer-encoding"].contains({ $0.lowercased() == "chunked" }) {
             $0.onBody(data)
         } else {
             $0.body += data
